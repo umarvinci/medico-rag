@@ -1,0 +1,237 @@
+name: medical-rag
+
+x-api-environment: &api-environment
+  # Development by design. Setting `production` here would make Settings refuse to start until
+  # every M12 control is satisfied — OIDC identity, no development principals, rate limiting on,
+  # HTTPS origins, offline-pinned models, and non-localhost backing services. See
+  # docs/architecture/production-deployment.md; a real deployment sets this from its pipeline
+  # rather than inheriting an image default.
+  # Upload ceiling. `MEDRAG_INGESTION__MAX_UPLOAD_BYTES` is what the application enforces;
+  # `MEDRAG_MAX_UPLOAD_MB` is what nginx renders into client_max_body_size. They are set from the
+  # same intent here and checked for agreement by scripts/production_preflight.py, because a
+  # proxy limit below the application limit turns an acceptable upload into an opaque 413.
+  MEDRAG_INGESTION__MAX_UPLOAD_BYTES: ${MEDRAG_INGESTION__MAX_UPLOAD_BYTES:-536870912}
+  MEDRAG_INGESTION__UPLOAD_TIMEOUT_SECONDS: ${MEDRAG_UPLOAD_TIMEOUT_SECONDS:-1800}
+  MEDRAG_ENVIRONMENT: ${MEDRAG_ENVIRONMENT:-development}
+  MEDRAG_AUTH__MODE: ${MEDRAG_AUTH__MODE:-development}
+  MEDRAG_DEV_PRINCIPALS: ${MEDRAG_DEV_PRINCIPALS:-[]}
+  MEDRAG_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-medrag}:${POSTGRES_PASSWORD:?Run scripts/init_local_env.py}@postgres:5432/${POSTGRES_DB:-medrag}
+  MEDRAG_REDIS_URL: redis://redis:6379/0
+  MEDRAG_QDRANT_URL: http://qdrant:6333
+  MEDRAG_QUERY_ENCODER__ENDPOINT: http://retrieval:8010
+  MEDRAG_RERANKER__ENDPOINT: http://retrieval:8010
+  MEDRAG_QUERY_ENCODER__OFFLINE: "true"
+  MEDRAG_S3_ENDPOINT: http://minio:9000
+  MEDRAG_S3_REGION: ${MEDRAG_S3_REGION:-us-east-1}
+  MEDRAG_S3_BUCKET: ${MEDRAG_S3_BUCKET:-medical-rag-originals}
+  MEDRAG_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-medrag-local}
+  MEDRAG_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?Run scripts/init_local_env.py}
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17.6-alpine}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-medrag}
+      POSTGRES_DB: ${POSTGRES_DB:-medrag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+    restart: unless-stopped
+  qdrant:
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.15.4}
+    ports: ["127.0.0.1:6333:6333", "127.0.0.1:6334:6334"]
+    volumes: ["qdrant-data:/qdrant/storage"]
+    # Readiness is checked through the API; do not assume curl exists in this image.
+
+    restart: unless-stopped
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4.5-alpine}
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["127.0.0.1:6379:6379"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+    restart: unless-stopped
+  minio:
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-medrag-local}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
+    volumes: ["minio-data:/data"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+    restart: unless-stopped
+  minio-init:
+    image: ${MINIO_MC_IMAGE:-minio/mc:RELEASE.2025-04-16T18-13-26Z}
+    depends_on:
+      minio: {condition: service_healthy}
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-medrag-local}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD}
+      BUCKET: ${MEDRAG_S3_BUCKET:-medical-rag-originals}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - 'mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null && mc mb --ignore-existing "local/$$BUCKET" && mc version enable "local/$$BUCKET"'
+    restart: "no"
+
+  api:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: infrastructure/docker/backend.Dockerfile
+    environment:
+      <<: *api-environment
+      # Generation lives only in the API, so the provider keys reach only the API. They are not in
+      # the shared anchor: the dispatcher, worker, retrieval runtime and frontend have no use for
+      # them, and a key that is never delivered cannot leak from those containers. Empty by
+      # default, which leaves the generator unconfigured rather than falling back to a model.
+      MEDRAG_APPROVED_MODELS: ${MEDRAG_APPROVED_MODELS:-[]}
+      MEDRAG_VERIFIER__PROVIDER: ${MEDRAG_VERIFIER__PROVIDER:-}
+      MEDRAG_VERIFIER__MODEL_ID: ${MEDRAG_VERIFIER__MODEL_ID:-}
+      MEDRAG_GENERATOR__PROVIDER: ${MEDRAG_GENERATOR__PROVIDER:-}
+      MEDRAG_GENERATOR__MODEL_ID: ${MEDRAG_GENERATOR__MODEL_ID:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_started}
+      minio-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=15)"]
+      interval: 20s
+      timeout: 16s
+      retries: 6
+    restart: unless-stopped
+    # No model is resident here; the API orchestrates and calls providers over HTTP.
+    deploy:
+      resources:
+        limits: {memory: 2G}
+        reservations: {memory: 512M}
+
+  frontend:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: infrastructure/docker/frontend.Dockerfile
+    environment:
+      # Rendered into client_max_body_size. Kept a little above the application's 512 MiB so the
+      # application, not the proxy, is what refuses an oversized upload.
+      MEDRAG_MAX_UPLOAD_MB: ${MEDRAG_MAX_UPLOAD_MB:-520}
+      MEDRAG_UPLOAD_TIMEOUT_SECONDS: ${MEDRAG_UPLOAD_TIMEOUT_SECONDS:-1800}
+    ports: ["127.0.0.1:5173:8080"]
+    depends_on:
+      api: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+    restart: unless-stopped
+  # Only the worker carries the parser and its models; the API and dispatcher stay lean.
+  worker:
+    profiles: ["app", "workers"]
+    build:
+      context: .
+      dockerfile: infrastructure/docker/worker.Dockerfile
+    environment:
+      <<: *api-environment
+      MEDRAG_PARSING__MAX_CONCURRENCY: "1"
+      # Parsing allocates and frees hundreds of megabytes per page window across many
+      # threads. Left to its default arena-per-thread growth, glibc keeps that space instead
+      # of reusing it and worker RSS ratchets with book length. Capping the arenas, together
+      # with the trim the parser performs between windows, is what keeps peak memory flat.
+      MALLOC_ARENA_MAX: "2"
+      # Provisioned by scripts/provision_embedding_model.py into the embedding-models volume, so
+      # the worker never downloads a model while a user is waiting.
+      MEDRAG_EMBEDDING__MODEL_CACHE_DIR: /home/medrag/models/embeddings
+      MEDRAG_EMBEDDING__OFFLINE: "true"
+      MEDRAG_EMBEDDING__TORCH_THREADS: "4"
+    volumes:
+      - "parser-models:/home/medrag/.cache"
+      - "embedding-models:/home/medrag/models/embeddings"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+    restart: unless-stopped
+    # Measured, not guessed: the 932-page textbook peaked at 4967182336 bytes (4.74 GiB) once
+    # page-window conversion and arena trimming were in place, and peak is bounded by
+    # `page_window_size` rather than by book length. 6G is that measurement plus headroom. The
+    # limit exists so a document that outgrows the design is killed here, against a named
+    # container, instead of the kernel choosing a victim across the host.
+    deploy:
+      resources:
+        limits: {memory: 6G}
+        reservations: {memory: 2G}
+
+  retrieval:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: infrastructure/docker/worker.Dockerfile
+    environment:
+      MEDRAG_QUERY_ENCODER__MODEL_CACHE_DIR: /home/medrag/models/embeddings
+      MEDRAG_RERANKER__MODEL_CACHE_DIR: /home/medrag/models/reranking
+      MEDRAG_QUERY_ENCODER__OFFLINE: "true"
+      MEDRAG_QUERY_ENCODER__TORCH_THREADS: "4"
+    volumes:
+      - "query-models:/home/medrag/models/embeddings"
+      - "reranker-models:/home/medrag/models/reranking"
+    command: ["uvicorn", "app.retrieval_service:create_app", "--factory", "--host", "0.0.0.0", "--port", "8010", "--no-access-log"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health/ready', timeout=30); urllib.request.urlopen('http://localhost:8010/health/reranker', timeout=30)"]
+      interval: 15s
+      timeout: 35s
+      start_period: 60s
+      retries: 10
+    restart: unless-stopped
+    # Holds the query encoder and the cross-encoder resident.
+    deploy:
+      resources:
+        limits: {memory: 4G}
+        reservations: {memory: 1G}
+
+  dispatcher:
+    profiles: ["app", "workers"]
+    build:
+      context: .
+      dockerfile: infrastructure/docker/backend.Dockerfile
+    environment: *api-environment
+    command: ["python", "-m", "workers.dispatcher"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: {memory: 512M}
+
+volumes:
+  reranker-models:
+  query-models:
+  parser-models:
+  postgres-data:
+  qdrant-data:
+  embedding-models:
+  redis-data:
+  minio-data:

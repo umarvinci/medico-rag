@@ -1,0 +1,18 @@
+/*
+ * The stylesheet, in layers.
+ *
+ * tokens      every colour, space, radius, shadow and type step, defined once
+ * base        the reset, the type scale, and the controls every page inherits
+ * shell       the rail, the header, the content column
+ * ask         the conversation, the answer, the evidence, the composer
+ * components  panels, notices, tables and the inspector surfaces
+ *
+ * The order matters: later files may lean on earlier ones, and nothing outside `tokens.css`
+ * writes a literal colour.
+ */
+@import "tailwindcss";
+@import "./styles/tokens.css";
+@import "./styles/base.css";
+@import "./styles/shell.css";
+@import "./styles/ask.css";
+@import "./styles/components.css";
